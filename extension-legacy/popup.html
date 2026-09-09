@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="uk">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DM Hour Unified</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <h1>DM Hour</h1>
+      <p id="connection" class="status">Перевірка локального сервера…</p>
+      <label>
+        Local API
+        <input id="backendUrl" value="http://127.0.0.1:8765">
+      </label>
+      <label>
+        API token (optional)
+        <input id="apiToken" type="password" autocomplete="off">
+      </label>
+      <label class="toggle danger">
+        <input id="armed" type="checkbox">
+        Arm Web MQTT sending
+      </label>
+      <div class="actions">
+        <button id="save">Зберегти</button>
+        <button id="poll">Взяти наступне завдання</button>
+        <button id="stop" class="stop">Emergency stop</button>
+      </div>
+      <pre id="result">Немає виконаних завдань.</pre>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+ig-session.json
+.DS_Store
+dm-hour-diag-*.json
+dm-hour-page-context-*.json
+dm-hour-backup-*.json
+

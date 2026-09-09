@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DM Hour</title>
+  <link rel="stylesheet" href="popup-parity.css">
+</head>
+<body>
+  <header><strong>DM Hour</strong><span id="runtime-status">Завантаження…</span></header>
+  <nav>
+    <button data-view="dashboard">Робота</button><button data-view="bots">Боти</button>
+    <button data-view="lists">DM Lists</button><button data-view="history">Історія</button>
+    <button data-view="errors">HTTP</button><button data-view="diag">Тест</button><button data-view="data">Дані</button>
+  </nav>
+  <main>
+    <section id="view-dashboard" class="view"></section>
+    <section id="view-bots" class="view hidden">
+      <div class="row spread"><h2>Боти</h2><button id="new-bot">+ Створити</button></div>
+      <div id="bot-list"></div>
+      <form id="bot-form" class="card hidden">
+        <input id="bot-id" type="hidden">
+        <label>Назва<input id="bot-name" required></label>
+        <label>Режим<select id="bot-type"><option value="0">DM by Monitor</option><option value="1">DM by Bulk</option></select></label>
+        <div class="grid3"><label>Інтервал min<input id="range-min" type="number" min="1" value="4"></label><label>max<input id="range-max" type="number" min="1" value="12"></label><label>DM у групі<input id="group-size" type="number" min="1" value="10"></label></div>
+        <div class="grid2"><label>Пауза групи min<input id="group-min" type="number" min="1" value="10"></label><label>max<input id="group-max" type="number" min="1" value="20"></label></div>
+        <div id="monitor-fields">
+          <label><input id="monitor-followers" type="checkbox" checked> DM новим підписникам</label><label>DM List<select id="follower-list"></select></label>
+          <label><input id="monitor-likers" type="checkbox" checked> DM після нового лайка</label><label>DM List<select id="liker-list"></select></label>
+          <label><input id="monitor-lookback" type="checkbox" checked> Відкинути старі події</label><label>Днів<input id="lookback-days" type="number" min="1" max="30" value="1"></label>
+          <div class="grid2"><label>DM/день min<input id="daily-min" type="number" min="1" value="10"></label><label>max<input id="daily-max" type="number" min="1" value="20"></label></div>
+        </div>
+        <div id="bulk-fields" class="hidden">
+          <label>Одержувачі<select id="bulk-target"><option value="0">Followers</option><option value="1">Followings</option><option value="2">Custom users</option></select></label>
+          <label id="target-account-label">Instagram username цільового акаунта<input id="target-account"></label>
+          <div id="custom-users-fields" class="hidden">
+            <label>Custom users<textarea id="custom-users" rows="5" placeholder="user_one&#10;user_two"></textarea></label>
+            <label>або CSV з колонкою Username<input id="recipient-csv" type="file" accept=".csv"></label><small id="csv-status"></small>
+          </div>
+          <label>Bulk DM List<select id="bulk-list"></select></label>
+          <label>Максимум користувачів<input id="bulk-limit" type="number" min="1" max="500" value="100"></label>
+          <label><input id="allow-previous" type="checkbox"> Can DM to previous user</label>
+        </div>
+        <label><input id="prefer-story-reply" type="checkbox"> Спочатку відповісти на сторіс, якщо вона є (немає — звичайний Direct)</label>
+        <div class="row"><button type="submit">Зберегти</button><button type="button" id="cancel-bot">Скасувати</button></div>
+      </form>
+    </section>
+    <section id="view-lists" class="view hidden">
+      <h2>DM Lists</h2><form id="list-form" class="card"><label>Назва<input id="list-name" required></label><label>Повідомлення<textarea id="list-message" rows="4" required></textarea></label><button>Додати список</button></form><div id="dm-lists"></div>
+    </section>
+    <section id="view-history" class="view hidden">
+      <h2>DM History</h2><div class="row"><button data-export="dm_message_history_pool">CSV export</button><button data-clear="dm_message_history_pool">Очистити</button><label class="file">CSV replace<input data-import="dm_message_history_pool" type="file" accept=".csv"></label></div><div id="message-history"></div>
+      <h2>DM Box</h2><div class="row"><button data-export="dm_user_history_pool">CSV export</button><button data-clear="dm_user_history_pool">Очистити</button><label class="file">CSV merge<input data-import="dm_user_history_pool" type="file" accept=".csv"></label></div><div id="user-history"></div>
+    </section>
+    <section id="view-errors" class="view hidden"><h2>IG Error Code Handler</h2><div id="error-settings"></div></section>
+    <section id="view-diag" class="view hidden">
+      <h2>Одна відправка</h2>
+      <form id="test-form" class="card">
+        <p class="muted">Одна жива відправка, без черги й історії. Без галочки — Direct (тред + MQTT). З галочкою — відповідь на сторіс, якщо сторіс немає — Direct.</p>
+        <label>Username отримувача<input id="test-username" placeholder="my_test_account" required></label>
+        <label>Текст<textarea id="test-text" rows="3" required>Привіт! Це технічна перевірка.</textarea></label>
+        <label><input id="test-story" type="checkbox"> Спробувати через сторіс (якщо немає — Direct)</label>
+        <div class="row"><button type="submit" id="test-send">Надіслати одне</button><button type="button" id="dump-page">Зняти токени зі сторінки</button></div>
+        <div id="test-result" class="muted"></div>
+      </form>
+
+      <h2>Журнал</h2>
+      <div class="card">
+        <label><input id="diag-toggle" type="checkbox"> Записувати діагностику</label>
+        <p class="muted">Зберігає сирі HTTP-відповіді та MQTT-кадри — останні 300 записів. Токен CSRF не пишеться. Вмикай на час перевірки.</p>
+        <label><input id="capture-toggle" type="checkbox"> Знімати трафік Instagram</label>
+        <p class="muted">Знімає WebSocket і HTTP (GraphQL/fetch) власного клієнта Instagram, з URL кадру. Після вмикання обов'язково онови вкладку Instagram (F5), зроби дію руками, тоді вимкни. Аналітику відсіюємо.</p>
+        <div class="row"><button id="diag-export">Вивантажити JSON</button><button id="diag-clear">Очистити</button><button id="diag-refresh">Оновити</button></div>
+      </div>
+      <div id="diag-log"></div>
+    </section>
+    <section id="view-data" class="view hidden">
+      <h2>Резервна копія</h2>
+      <div class="card">
+        <p class="muted">Копія містить усі списки, ботів, історію та налаштування. Зроби її перед кожною зміною — відновлення повертає стан повністю.</p>
+        <div class="row"><button id="backup-export">Зберегти копію</button><label class="file">Відновити з копії<input id="backup-import" type="file" accept=".json"></label></div>
+        <div id="backup-info" class="muted"></div>
+      </div>
+    </section>
+  </main>
+  <div id="toast"></div>
+  <script src="common.js"></script><script src="popup-parity.js"></script>
+</body>
+</html>

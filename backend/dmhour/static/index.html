@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="uk">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DM Hour</title>
+    <link rel="stylesheet" href="/static/app.css">
+  </head>
+  <body>
+    <header>
+      <h1>DM Hour</h1>
+      <p id="health" class="pill">Перевірка…</p>
+    </header>
+    <section class="controls">
+      <label>
+        API token
+        <input id="token" type="password" autocomplete="off">
+      </label>
+      <button id="refresh" type="button">Оновити</button>
+      <button id="stop" class="danger" type="button">Emergency stop</button>
+      <button id="clear-stop" type="button">Зняти stop</button>
+    </section>
+    <section>
+      <h2>Кампанії</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Назва</th>
+              <th>Mode</th>
+              <th>Transport</th>
+              <th>Status</th>
+              <th>Queued</th>
+              <th>Sent</th>
+              <th>Fail/Skip</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="campaigns"></tbody>
+        </table>
+      </div>
+    </section>
+    <section>
+      <h2>Історія</h2>
+      <pre id="history">Немає записів.</pre>
+    </section>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

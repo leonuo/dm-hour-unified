@@ -1,0 +1,57 @@
+{
+  "manifest_version": 3,
+  "name": "DM Hour — IGDMBot parity build",
+  "version": "0.2.0",
+  "description": "Extension-native Monitor and Bulk DM runtime based on the verified IGDMBot 1.6.4 contract",
+  "icons": {
+    "16": "icons/logo_16.png",
+    "32": "icons/logo_32.png",
+    "48": "icons/logo_48.png",
+    "128": "icons/logo_128.png"
+  },
+  "action": {
+    "default_popup": "popup-parity.html",
+    "default_title": "DM Hour Unified",
+    "default_icon": {
+      "16": "icons/logo_16.png",
+      "32": "icons/logo_32.png",
+      "48": "icons/logo_48.png",
+      "128": "icons/logo_128.png"
+    }
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  },
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  "permissions": [
+    "alarms",
+    "cookies",
+    "storage",
+    "tabs",
+    "unlimitedStorage"
+  ],
+  "host_permissions": [
+    "https://*.instagram.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://www.instagram.com/*"],
+      "js": ["common.js", "content-parity.js"],
+      "run_at": "document_end"
+    },
+    {
+      "matches": ["https://www.instagram.com/*"],
+      "js": ["igcapture.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["ijsource.js", "icons/*"],
+      "matches": ["https://www.instagram.com/*"]
+    }
+  ]
+}
