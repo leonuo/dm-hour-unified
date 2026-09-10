@@ -1,10 +1,26 @@
 (() => {
   "use strict";
-  const { EVENT, APP, ERROR_DEFAULTS, storage, randomInt, todayKey, uuid, recordsToCsv, exportSnapshot, importSnapshot, normalizeUsername } = DMHCore;
+  const { EVENT, APP, ERROR_DEFAULTS, storage, randomInt, todayKey, uuid, recordsToCsv, exportSnapshot, importSnapshot, normalizeUsername, poolKey } = DMHCore;
   const $ = (selector) => document.querySelector(selector);
   let state = {}, pendingCsv = null;
 
   document.addEventListener("DOMContentLoaded", boot);
+
+  /**
+   * The account that owns this Chrome profile's current Instagram session. The
+   * popup is an extension page, so it can read `ds_user_id` directly — the same
+   * source the content script re-checks in `getSession`. Pools are read and
+   * written under this id so two accounts never mix history or limits.
+   */
+  async function accountId() {
+    try {
+      const cookie = await chrome.cookies.get({ url: "https://www.instagram.com", name: "ds_user_id" });
+      if (cookie?.value) return String(cookie.value);
+    } catch (_error) { /* popup without cookies permission should not happen */ }
+    return state.work_bot?.account_id || null;
+  }
+
+  const PK = (name) => poolKey(state._account_id || null, name);
 
   async function boot() {
     bind(); await refresh(); showView("dashboard");
@@ -47,9 +63,14 @@
   }
 
   async function refresh() {
-    state = await storage.get(["bot_list", "work_bot", "comment_list", "comments", "dm_message_history_pool", "dm_user_history_pool"]);
+    state = { _account_id: await accountId() };
+    const mhKey = PK("dm_message_history_pool"), uhKey = PK("dm_user_history_pool");
+    const loaded = await storage.get(["bot_list", "work_bot", "comment_list", "comments", mhKey, uhKey]);
+    Object.assign(state, loaded);
+    state._account_id = state.work_bot?.account_id || state._account_id || null;
     state.bot_list ||= []; state.comment_list ||= []; state.comments ||= [];
-    state.dm_message_history_pool ||= []; state.dm_user_history_pool ||= [];
+    state.dm_message_history_pool = state[mhKey] || [];
+    state.dm_user_history_pool = state[uhKey] || [];
     renderDashboard(); renderBots(); renderLists(); renderHistory(); await renderErrors(); await renderBackupInfo(); await renderDiagLog(); fillListSelects();
   }
 
@@ -128,19 +149,23 @@
 
   async function startBot(id) {
     const bot = structuredClone(state.bot_list.find((item) => item.id === id)); if (!bot) return;
-    Object.assign(bot, { is_working: true, is_complete: false, dm_num: 0, status_code: 200 });
-    const patch = { work_bot: bot, dm_custom_dup_users_history_bot: [], bulk_runtime_state: {} };
+    const acc = await accountId();
+    Object.assign(bot, { is_working: true, is_complete: false, dm_num: 0, status_code: 200, account_id: acc });
+    const dupKey = PK("dm_custom_dup_users_history_bot"), rtKey = PK("bulk_runtime_state"), qKey = PK("dm_custom_queue_bot_pool");
+    const patch = { work_bot: bot, [dupKey]: [], [rtKey]: {} };
     if (bot.bot_type === 0) { bot.day_dm_num = randomInt(...bot.dm_per_day_by_monitor_nums); patch.monitor_store_date = todayKey(); }
-    if (bot.bot_type === 1 && bot.bulk_dm_target_type === 2) patch.dm_custom_queue_bot_pool = bot.send_message_type === 1 ? structuredClone(bot.bulk_dm_target_type_value) : normalizeCustom(bot.bulk_dm_target_type_value).split(",");
+    if (bot.bot_type === 1 && bot.bulk_dm_target_type === 2) patch[qKey] = bot.send_message_type === 1 ? structuredClone(bot.bulk_dm_target_type_value) : normalizeCustom(bot.bulk_dm_target_type_value).split(",");
     await storage.set(patch); await chrome.alarms.clear(APP.ALARM.MONITOR); await chrome.alarms.clear(APP.ALARM.NEXT_DM);
     await chrome.runtime.sendMessage({ type: EVENT.CHECK_TAB_SWITCH_BOT, data: {} }); await refresh(); showView("dashboard");
   }
 
   async function runtimeAction(action) {
     const bot = await storage.getValue("work_bot"); if (!bot) return;
+    state._account_id = bot.account_id || await accountId();
+    const rtKey = PK("bulk_runtime_state");
     if (action === "pause") { bot.is_working = false; await chrome.alarms.clear(APP.ALARM.MONITOR); await chrome.alarms.clear(APP.ALARM.NEXT_DM); await storage.set({ work_bot: bot }); }
     if (action === "resume") { bot.is_working = true; bot.status_code = 200; await storage.set({ work_bot: bot }); await chrome.runtime.sendMessage({ type: EVENT.CHECK_TAB_SWITCH_BOT, data: {} }); }
-    if (action === "stop") { await storage.remove(["work_bot", "bulk_runtime_state"]); await chrome.runtime.sendMessage({ type: EVENT.CHECK_TAB_STOP_BOT, data: {} }); }
+    if (action === "stop") { await storage.remove(["work_bot", rtKey]); await chrome.runtime.sendMessage({ type: EVENT.CHECK_TAB_STOP_BOT, data: {} }); }
     if (action === "skip") await chrome.runtime.sendMessage({ type: EVENT.SKIP_CURRENT_USER, data: {} });
     await refresh();
   }
@@ -177,12 +202,32 @@
     if (b.dataset.editMessage) { const item = state.comments.find((x) => x.id === b.dataset.editMessage), value = prompt("Message template", item.content); if (value?.trim()) { item.content = value.trim(); await storage.set({ comments: state.comments }); await refresh(); } return; }
     if (b.dataset.deleteMessage) { state.comments = state.comments.filter((x) => x.id !== b.dataset.deleteMessage); await storage.set({ comments: state.comments }); return refresh(); }
     if (b.dataset.export) return download(`${b.dataset.export}.csv`, recordsToCsv(state[b.dataset.export] || []));
-    if (b.dataset.clear) { await storage.set({ [b.dataset.clear]: [] }); return refresh(); }
+    if (b.dataset.exportXlsx) {
+      const records = state[b.dataset.exportXlsx] || [];
+      const rows = DMHXlsx.recordsToRows(records);
+      return downloadBlob(`${b.dataset.exportXlsx}.xlsx`, DMHXlsx.writeXlsxBlob(rows));
+    }
+    if (b.dataset.clear) { await storage.set({ [PK(b.dataset.clear)]: [] }); return refresh(); }
   }
 
   async function importHistory(event) {
-    const key = event.target.dataset.import, rows = parseCsv(await event.target.files[0].text());
-    await storage.set({ [key]: key === "dm_message_history_pool" ? rows : [...(state[key] || []), ...rows] }); await refresh();
+    const key = event.target.dataset.import;
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    let rows;
+    try {
+      rows = /\.xlsx?$/i.test(file.name)
+        ? DMHXlsx.readXlsxDicts(await file.arrayBuffer())
+        : parseCsv(await file.text());
+    } catch (error) {
+      return toast(`Не вдалося прочитати: ${error.message}`);
+    }
+    if (!rows.length) return toast("Файл порожній або без колонок");
+    const scoped = PK(key);
+    const prior = (await storage.getValue(scoped, [])) || [];
+    const merged = key === "dm_message_history_pool" ? rows : [...prior, ...rows];
+    await storage.set({ [scoped]: merged }); await refresh();
   }
 
   document.addEventListener("change", async (event) => {
@@ -201,7 +246,10 @@
   function numbers(a, b) { const x = Number($(a).value), y = Number($(b).value); return [Math.min(x, y), Math.max(x, y)]; }
   function download(name, text, mime = "text/csv", bom = true) {
     const parts = bom ? ["\uFEFF", text] : [text];
-    const url = URL.createObjectURL(new Blob(parts, { type: mime }));
+    downloadBlob(name, new Blob(parts, { type: mime }));
+  }
+  function downloadBlob(name, blob) {
+    const url = URL.createObjectURL(blob);
     const a = document.createElement("a"); a.href = url; a.download = name; a.click(); URL.revokeObjectURL(url);
   }
 
@@ -316,13 +364,14 @@
 
   async function renderBackupInfo() {
     const version = await storage.getValue("schema_version", 0);
+    const account = state._account_id ? `акаунт ${state._account_id}` : "акаунт не визначено";
     const counts = [
       ["\u0431\u043E\u0442\u0456\u0432", state.bot_list.length],
       ["\u0441\u043F\u0438\u0441\u043A\u0456\u0432", state.comment_list.length],
       ["\u043F\u043E\u0432\u0456\u0434\u043E\u043C\u043B\u0435\u043D\u044C", state.comments.length],
       ["\u0432 \u0456\u0441\u0442\u043E\u0440\u0456\u0457", state.dm_message_history_pool.length]
     ].map(([label, value]) => `${value} ${label}`).join(" \u00B7 ");
-    $("#backup-info").textContent = `\u0421\u0445\u0435\u043C\u0430 \u0441\u0445\u043E\u0432\u0438\u0449\u0430 v${version || "\u2014"} \u00B7 ${counts}`;
+    $("#backup-info").textContent = `\u0421\u0445\u0435\u043C\u0430 \u0441\u0445\u043E\u0432\u0438\u0449\u0430 v${version || "\u2014"} \u00B7 ${account} \u00B7 ${counts}`;
   }
   function toast(message) { const t = $("#toast"); t.textContent = message; t.style.display = "block"; setTimeout(() => t.style.display = "none", 3000); }
   function escapeHtml(value) { return String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]); }

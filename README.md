@@ -4,6 +4,8 @@ This repository now contains an extension-native implementation of the verified 
 
 The earlier Python/SQLite campaign engine remains under `backend/` as preserved, optional code. The superseded extension files `background.js`, `content.js`, `popup.html`, `popup.css`, and `popup.js` now live in `extension-legacy/`: they are kept for comparison and are no longer part of the loaded extension directory.
 
+See [`UPDATES.md`](./UPDATES.md) for the 10 September 2026 change log: account-scoped pools, mid-run account-switch guard, story-reply `doc_id` self-healing, MQTT `reel_share` fallback, and XLS/XLSX history import/export.
+
 ## The working tab
 
 The bot drives its own Instagram tab and opens it itself, so it does not depend on what the person already has open. That tab is covered and labelled the way IGDMBot covers its own — a dark mask, the icon, and "DM Hour працює. / Не закривай цю вкладку." — plus a `beforeunload` prompt, mirroring `addLeaveAlert`. Without the marker the bot silently opens an Instagram tab and the operator has no way to tell which of their tabs must stay open; closing it stops the run.
@@ -96,8 +98,7 @@ Starting a bot is a live action: it can call Instagram's web endpoints and send 
 ## Recipient and history files
 
 - Campaign recipients: CSV only, exact `Username` header, maximum 10,000 data rows and 10 MiB; all other columns are retained for placeholders.
-- History: CSV export/import is implemented. DM History import replaces its pool; DM Box import merges into its pool.
-- XLS/XLSX history import/export is the one intentionally unimplemented rubric item. It accounts for the missing 2 points in the current 98/100 result.
+- History: CSV export/import is implemented. DM History import replaces its pool; DM Box import merges into its pool. XLS/XLSX history import/export is implemented via `extension/xlsx.js` (a dependency-free port of `backend/dmhour/xlsx.py`); the full 100/100 rubric now passes.
 
 ## Verification and mathematical score
 

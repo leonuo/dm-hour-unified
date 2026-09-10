@@ -71,14 +71,16 @@
     LOGGED_OUT: 302,
     UNKNOWN: 10001,
     EMPTY_DM_LIST: 10002,
-    NETWORK: 10004
+    NETWORK: 10004,
+    ACCOUNT_CHANGED: 10005
   });
 
   const STATUS_MESSAGE = Object.freeze({
     302: "Please log in to your Instagram account again, come back, and click Continue button to start working.",
     10001: "Something went wrong, you can click Continue button to start working.",
     10002: "The DM list for the robot is empty.",
-    10004: "Network error. Please check your internet connection."
+    10004: "Network error. Please check your internet connection.",
+    10005: "The Instagram account changed mid-run. The bot stopped to avoid sending from the wrong profile. Sign back in and Continue."
   });
 
   function statusError(code, message) {
@@ -116,7 +118,7 @@
    * install that already holds campaign history is upgraded instead of being
    * silently misread by code that expects a newer shape.
    */
-  const SCHEMA_VERSION = 2;
+  const SCHEMA_VERSION = 3;
 
   /** version -> async (storage) => void. Version 1 is the original layout. */
   const MIGRATIONS = Object.freeze({
@@ -137,8 +139,75 @@
         patch.work_bot = work;
       }
       if (Object.keys(patch).length) await store.set(patch);
+    },
+    /**
+     * Namespace the campaign pools under the logged-in account. Two Instagram
+     * accounts in one Chrome profile used to share history, dedup, the monitor
+     * queue and the daily counter, which silently corrupted a run when the
+     * operator switched accounts mid-campaign. The pools are now read and
+     * written through `poolKey(accountId, name)`; this step moves any existing
+     * unscoped pool onto the current account once, so a single-account install
+     * keeps its history after the upgrade.
+     */
+    3: async (store) => {
+      const accountId = await readDsUserIdCookie();
+      const bots = await store.getValue("bot_list", []);
+      const work = await store.getValue("work_bot");
+      const patch = {};
+      let botsChanged = false;
+      for (const bot of bots) {
+        if (!Object.prototype.hasOwnProperty.call(bot, "account_id")) {
+          bot.account_id = null;
+          botsChanged = true;
+        }
+      }
+      if (botsChanged) patch.bot_list = bots;
+      if (work && !Object.prototype.hasOwnProperty.call(work, "account_id")) {
+        work.account_id = null;
+        patch.work_bot = work;
+      }
+      if (accountId) {
+        const POOLS = [
+          "dm_message_history_pool", "dm_user_history_pool", "monitor_inbox_pool",
+          "dm_custom_queue_bot_pool", "dm_custom_dup_users_history_bot",
+          "dm_404_custom_dup_users_history_bot"
+        ];
+        const all = await chrome.storage.local.get(null);
+        for (const key of POOLS) {
+          const scoped = poolKey(accountId, key);
+          if (all[key] !== undefined && all[scoped] === undefined) {
+            patch[scoped] = all[key];
+            patch[key] = null;
+          }
+        }
+      }
+      if (Object.keys(patch).length) await store.set(patch);
     }
   });
+
+  /**
+   * Best-effort read of the ds_user_id cookie. Available in the background
+   * service worker and in extension pages (popup), which is exactly where
+   * `migrateStorage` runs; content scripts reach it over messaging instead, so
+   * this returns null there and the runtime `poolKey` falls back to global.
+   */
+  async function readDsUserIdCookie() {
+    if (!globalThis.chrome?.cookies?.get) return null;
+    try {
+      const cookie = await chrome.cookies.get({ url: "https://www.instagram.com", name: "ds_user_id" });
+      return cookie?.value || null;
+    } catch (_error) { return null; }
+  }
+
+  /**
+   * Account-scoped storage key. Pools are namespaced by ds_user_id so two IG
+   * accounts in one Chrome profile keep separate history, dedup, limits and
+   * monitor queues. Falls back to the bare key when no account is known yet,
+   * which keeps a fresh install readable before the first login.
+   */
+  function poolKey(accountId, key) {
+    return accountId ? `${accountId}:${key}` : key;
+  }
 
   /**
    * Keys that describe this browser session only and never travel in a backup:
@@ -442,6 +511,31 @@
     return hit ? hit.value : null;
   }
 
+  /**
+   * Pull a live `doc_id` for a GraphQL friendly-name out of the page bundle.
+   * Instagram retires mutation doc_ids, and the bundled page still carries the
+   * live mapping for `IGDirectStoryShareReplyMutation` as a Relay preset object
+   * shaped like `{ id, name, queryID/doc_id, ... }`. This walks the harvested
+   * leaves and returns the first doc_id whose sibling friendly-name matches.
+   * Returns null when the bundle has no mapping, in which case the captured
+   * outgoing GraphQL request (igcapture) is the other route to a live doc_id.
+   */
+  function findStoryReplyDocId(harvested, friendlyName) {
+    if (!friendlyName) return null;
+    for (const item of harvested) {
+      const key = String(item.key || "").toLowerCase();
+      if (key !== "doc_id" && key !== "docid" && key !== "query_id" && key !== "queryid") continue;
+      const parentPath = String(item.path || "").split(".").slice(0, -1).join(".");
+      const sibling = harvested.find((entry) => {
+        if (entry === item) return false;
+        const entryParent = String(entry.path || "").split(".").slice(0, -1).join(".");
+        return entryParent === parentPath && String(entry.value || "") === friendlyName;
+      });
+      if (sibling) return String(item.value);
+    }
+    return null;
+  }
+
   function jazoestFrom(token) {
     if (!token) return null;
     let sum = 0;
@@ -498,6 +592,11 @@
     };
     if (!tokens.fb_dtsg && modules.DTSGInitData?.token) tokens.fb_dtsg = modules.DTSGInitData.token;
     if (!tokens.jazoest) tokens.jazoest = jazoestFrom(tokens.fb_dtsg);
+    // Self-healing evidence for the story-reply GraphQL doc_id: Instagram
+    // retires mutation doc_ids, and the bundled page still carries the live
+    // mapping for `IGDirectStoryShareReplyMutation`. `findStoryReplyDocId` walks
+    // the harvested leaves for a doc_id whose sibling friendly-name matches.
+    tokens.story_reply_doc_id = findStoryReplyDocId(harvested, APP.STORY.REPLY_NAME);
     const compact = {};
     for (const [name, body] of Object.entries(modules)) compact[name] = compactModule(body);
     return {
@@ -535,6 +634,9 @@
     migrateStorage,
     exportSnapshot,
     importSnapshot,
+    poolKey,
+    readDsUserIdCookie,
+    findStoryReplyDocId,
     DIAG_LIMIT,
     diagEnabled,
     diagRecord,

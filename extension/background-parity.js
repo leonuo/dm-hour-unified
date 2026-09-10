@@ -200,7 +200,9 @@
 
   async function checkMonitorQueue() {
     if (await chrome.alarms.get(APP.ALARM.NEXT_DM)) return;
-    if ((await storage.getValue("monitor_inbox_pool", [])).length) await directNext();
+    const bot = await storage.getValue("work_bot");
+    const key = DMHCore.poolKey(bot?.account_id, "monitor_inbox_pool");
+    if ((await storage.getValue(key, [])).length) await directNext();
   }
 
   async function startMonitor() {
@@ -209,14 +211,18 @@
   }
 
   async function skipCurrent() {
-    const state = await storage.get(["work_bot", "dm_custom_queue_bot_pool", "monitor_inbox_pool"]);
+    const bot = await storage.getValue("work_bot");
+    const queueKey = DMHCore.poolKey(bot?.account_id, "dm_custom_queue_bot_pool");
+    const inboxKey = DMHCore.poolKey(bot?.account_id, "monitor_inbox_pool");
+    const state = await storage.get(["work_bot", queueKey, inboxKey]);
+    const queue = state[queueKey], inbox = state[inboxKey];
     let username;
-    if (state.dm_custom_queue_bot_pool?.length) {
-      const item = state.dm_custom_queue_bot_pool.shift(); username = item?.Username || item?.username || item;
-      await storage.set({ dm_custom_queue_bot_pool: state.dm_custom_queue_bot_pool });
-    } else if (state.work_bot?.bot_type === 0 && state.monitor_inbox_pool?.length) {
-      username = state.monitor_inbox_pool.shift()?.username;
-      await storage.set({ monitor_inbox_pool: state.monitor_inbox_pool });
+    if (queue?.length) {
+      const item = queue.shift(); username = item?.Username || item?.username || item;
+      await storage.set({ [queueKey]: queue });
+    } else if (state.work_bot?.bot_type === 0 && inbox?.length) {
+      username = inbox.shift()?.username;
+      await storage.set({ [inboxKey]: inbox });
     }
     await notify(EVENT.SKIP_CURRENT_USER_RESPONSE, { username });
     return { username };

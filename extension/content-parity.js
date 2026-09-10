@@ -3,7 +3,7 @@
   const {
     EVENT, PORT, APP, STATUS, storage, randomInt, uuid,
     prepareMessage, messagesForList, normalizeUsername, shouldKeepTabOpen, statusError, isLoggedOutBody,
-    diagRecord, redactHeaders, truncate, extractInstagramPageContext
+    diagRecord, redactHeaders, truncate, extractInstagramPageContext, poolKey
   } = DMHCore;
   let executionPort = null;
   let session = null;
@@ -88,19 +88,36 @@
     }
   }
 
-  window.addEventListener("message", (event) => {
+  window.addEventListener("message", async (event) => {
     if (event.source !== window) return;
     // Frames observed on Instagram's own edge-chat socket. This is how the wire
     // format of a message type we have not implemented gets established from
     // evidence: switch capture on, perform the action by hand, read the frame.
     if (event.data?.type === "INJECT_CAPTURE") {
+      const capture = event.data;
       void diagRecord({
         kind: "capture",
-        direction: event.data.direction || null,
-        label: event.data.label || "instagram.frame",
-        url: event.data.url || null,
-        detail: event.data.detail || {}
+        direction: capture.direction || null,
+        label: capture.label || "instagram.frame",
+        url: capture.url || null,
+        detail: capture.detail || {}
       });
+      // Self-healing source for the story-reply GraphQL doc_id: the official
+      // client performs the same mutation with the live doc_id, and igcapture
+      // forwards its outgoing body here. Parse the URL-encoded form for the
+      // friendly-name/doc_id pair and persist it, so a stale hardcoded doc_id
+      // can be replaced from evidence on the next attempt.
+      if (capture.label === "instagram.http" && capture.direction === "out") {
+        const body = String(capture.detail?.body || "");
+        const name = parseFormField(body, "fb_api_req_friendly_name");
+        if (name === APP.STORY.REPLY_NAME) {
+          const docId = parseFormField(body, "doc_id");
+          if (docId) {
+            await storage.set({ story_reply_doc_id: String(docId) });
+            await diagRecord({ kind: "note", label: "doc_id.captured", detail: { doc_id: String(docId), friendly_name: name } });
+          }
+        }
+      }
       return;
     }
     // Raw MQTT frames from the page bridge, which cannot reach chrome.storage.
@@ -211,8 +228,27 @@
     return session;
   }
 
+  /**
+   * IGDMBot caches ds_user_id/csrftoken for the lifetime of the tab. That is a
+   * latent footgun for an operator who runs two Instagram accounts in one
+   * Chrome profile: between two cycles (minutes apart) they can switch the
+   * account in the pinned tab, and a cached session would then send a DM from
+   * the wrong profile — Instagram may even accept it. `getSession` re-checks
+   * the live cookie before returning the cache, and drops it on a mismatch so
+   * the next call re-reads both cookies. This is a deliberate deviation from
+   * the source, in the same spirit as `runExclusive`.
+   */
   async function getSession() {
-    return session ?? readSession();
+    if (session) {
+      const live = await chrome.runtime.sendMessage({ type: EVENT.GET_COOKIE, data: { url: "https://www.instagram.com", name: "ds_user_id" } });
+      if (live && String(live) !== String(session.ds_user_id)) {
+        await diagRecord({ kind: "note", label: "account.switched_detected", detail: { cached: session.ds_user_id, live } });
+        dropSession();
+      } else {
+        return session;
+      }
+    }
+    return readSession();
   }
 
   /**
@@ -226,6 +262,41 @@
 
   function dropSession() {
     session = null;
+  }
+
+  /**
+   * Pools are namespaced by ds_user_id so two IG accounts in one Chrome profile
+   * keep separate history, dedup, limits and monitor queues. `session` is set
+   * before any pool access (every entry point calls `beginRun` first), so the
+   * fallback-to-global branch only covers a brand-new install pre-login.
+   */
+  function K(name) { return poolKey(session?.ds_user_id, name); }
+  async function getPool(name, fallback) { return storage.getValue(K(name), fallback); }
+  async function getPools(names) {
+    const scoped = names.map(K);
+    const raw = await storage.get(scoped);
+    const out = {};
+    for (let i = 0; i < names.length; i += 1) out[names[i]] = raw[scoped[i]];
+    return out;
+  }
+  async function setPools(pairs) {
+    const obj = {};
+    for (const [name, value] of pairs) obj[K(name)] = value;
+    await storage.set(obj);
+  }
+
+  /**
+   * Guards against the operator switching the Instagram account mid-campaign:
+   * if the bot was started under one ds_user_id and the live session is now a
+   * different one, the run must stop with a human-readable status rather than
+   * deliver DMs from the wrong profile.
+   */
+  async function assertSameAccount(bot) {
+    if (!bot?.account_id) return;
+    const live = await getSession();
+    if (String(live.ds_user_id) !== String(bot.account_id)) {
+      throw statusError(STATUS.ACCOUNT_CHANGED);
+    }
   }
 
   function headers(csrfToken) {
@@ -280,6 +351,7 @@
     const bot = await workBot();
     if (!bot?.is_working || bot.is_complete || bot.bot_type !== 0) return;
     const auth = await beginRun();
+    await assertSameAccount(bot);
     const response = await fetch("https://i.instagram.com/api/v1/news/inbox/", {
       method: "POST",
       credentials: "include",
@@ -296,7 +368,7 @@
       const after = Date.now() / 1000 - 86400 * Number(bot.skip_day_before_by_monitor_num);
       stories = stories.filter((story) => Number(story.args?.timestamp || 0) > after);
     }
-    const pool = await storage.getValue("monitor_inbox_pool", []);
+    const pool = await getPool("monitor_inbox_pool", []);
     const known = new Set(pool.map((user) => String(user.id)));
     for (const story of stories) {
       let type;
@@ -307,7 +379,7 @@
       pool.push({ id: String(args.profile_id), username: args.profile_name, profile_img: args.profile_image, type, timestamp: args.timestamp });
       known.add(String(args.profile_id));
     }
-    await storage.set({ monitor_inbox_pool: pool });
+    await setPools([["monitor_inbox_pool", pool]]);
     executionPort?.postMessage({ type: PORT.CHECK_MONITOR_OR_SEND });
   }
 
@@ -316,15 +388,16 @@
     if (!bot?.is_working || bot.is_complete || bot.bot_type !== 0) return;
     if (Number(bot.dm_num || 0) >= Number(bot.day_dm_num || 0)) return;
     await beginRun();
+    await assertSameAccount(bot);
     await assertDmListsReady(bot);
-    const pool = await storage.getValue("monitor_inbox_pool", []);
-    const history = await storage.getValue("dm_user_history_pool", []);
+    const pool = await getPool("monitor_inbox_pool", []);
+    const history = await getPool("dm_user_history_pool", []);
     let user;
     while (pool.length && !user) {
       const candidate = pool.pop();
       if (!history.some((item) => String(item.id) === String(candidate.id))) user = candidate;
     }
-    await storage.set({ monitor_inbox_pool: pool });
+    await setPools([["monitor_inbox_pool", pool]]);
     if (!user) return;
     const listId = user.type === 0 ? bot.new_follower_dm_list_id : bot.new_like_dm_list_id;
     await sendRecipientMaybeStory(user, listId);
@@ -353,12 +426,13 @@
     const bot = await workBot();
     if (!bot?.is_working || bot.is_complete || bot.bot_type !== 1) return;
     await beginRun();
+    await assertSameAccount(bot);
     await assertDmListsReady(bot);
     if (bot.bulk_dm_target_type === 2) return sendCustom(bot);
     if (Number(bot.dm_num || 0) >= Number(bot.bulk_limit_max_users_count)) {
       await updateBot({ is_complete: true }); return;
     }
-    let runtime = await storage.getValue("bulk_runtime_state", {});
+    let runtime = await getPool("bulk_runtime_state", {});
     if (!runtime.target_id) {
       const found = await requestUser(bot.bulk_dm_target_type_value);
       const user = found?.data?.user;
@@ -366,10 +440,10 @@
       runtime = { target_id: String(user.id || user.pk), edges: [], cursor: "", has_next_page: true };
     }
     if (!runtime.edges?.length && runtime.has_next_page !== false) runtime = await fetchGraphPage(bot, runtime);
-    const history = await storage.getValue("dm_user_history_pool", []);
+    const history = await getPool("dm_user_history_pool", []);
     // `handleDMbyBulkEdges` skips an edge when its username is in the 404 pool
     // OR its id is already in the DM history — both checks, in that order.
-    const missing = await storage.getValue("dm_404_custom_dup_users_history_bot", []);
+    const missing = await getPool("dm_404_custom_dup_users_history_bot", []);
     let user;
     while (runtime.edges?.length && !user) {
       const node = runtime.edges.shift()?.node;
@@ -379,7 +453,7 @@
         user = { id: String(node.id), username: node.username, profile_img: node.profile_pic_url, type: 2, timestamp: Date.now() };
       }
     }
-    await storage.set({ bulk_runtime_state: runtime });
+    await setPools([["bulk_runtime_state", runtime]]);
     if (user) return sendRecipientMaybeStory(user, bot.bulk_dm_list_id);
     if (runtime.has_next_page) {
       setTimeout(() => sendBulk().catch(handleError), randomInt(3000, 6000));
@@ -419,21 +493,21 @@
   }
 
   async function sendCustom(bot) {
-    const queue = await storage.getValue("dm_custom_queue_bot_pool", []);
-    const prior = await storage.getValue("dm_user_history_pool", []);
-    const runDup = await storage.getValue("dm_custom_dup_users_history_bot", []);
-    const missing = await storage.getValue("dm_404_custom_dup_users_history_bot", []);
+    const queue = await getPool("dm_custom_queue_bot_pool", []);
+    const prior = await getPool("dm_user_history_pool", []);
+    const runDup = await getPool("dm_custom_dup_users_history_bot", []);
+    const missing = await getPool("dm_404_custom_dup_users_history_bot", []);
     while (queue.length) {
       const row = queue[0];
       const username = String(typeof row === "object" ? row.Username : row).trim();
       if (!username || missing.some((x) => x.username === username) || runDup.some((x) => x.username === username) || (!bot.can_dm_to_privious_user && prior.some((x) => x.username === username))) {
-        queue.shift(); await storage.set({ dm_custom_queue_bot_pool: queue }); continue;
+        queue.shift(); await setPools([["dm_custom_queue_bot_pool", queue]]); continue;
       }
       const found = await requestUser(username, typeof row === "object" ? row : undefined, !bot.can_dm_to_privious_user);
       const data = found?.data?.user;
       if (!data) return unavailable(username);
       const user = { id: String(data.id || data.pk), username: data.username, profile_img: data.profile_pic_url, type: 2, timestamp: Date.now() };
-      runDup.push(user); await storage.set({ dm_custom_dup_users_history_bot: runDup });
+      runDup.push(user); await setPools([["dm_custom_dup_users_history_bot", runDup]]);
       return sendRecipientMaybeStory(user, bot.bulk_dm_list_id, typeof row === "object" ? row : undefined, !bot.can_dm_to_privious_user);
     }
     await updateBot({ is_complete: true });
@@ -441,10 +515,10 @@
 
   async function isDuplicateRecipient(username, goDup = true) {
     if (goDup) {
-      const history = await storage.getValue("dm_user_history_pool", []);
+      const history = await getPool("dm_user_history_pool", []);
       if (history.some((item) => item.username === username)) return true;
     }
-    const missing = await storage.getValue("dm_404_custom_dup_users_history_bot", []);
+    const missing = await getPool("dm_404_custom_dup_users_history_bot", []);
     return missing.some((item) => item.username === username);
   }
 
@@ -538,7 +612,7 @@
     return pickStoryFromReel(payload, userId);
   }
 
-  async function postStoryReply(user, text, story, tokens) {
+  async function postStoryReply(user, text, story, tokens, docId) {
     const auth = await getSession();
     const offlineId = `${Date.now()}${String(Math.floor(Math.random() * 1e6)).padStart(6, "0")}`;
     const body = new URLSearchParams({
@@ -571,7 +645,7 @@
           text: { sensitive_string_value: String(text) }
         }
       }),
-      doc_id: APP.STORY.REPLY_DOC
+      doc_id: String(docId || APP.STORY.REPLY_DOC)
     });
     const requestHeaders = {
       ...headers(auth.csrftoken),
@@ -581,7 +655,7 @@
       "x-fb-lsd": tokens.lsd
     };
     const url = "https://www.instagram.com/api/graphql";
-    await diagRecord({ kind: "http", direction: "out", label: APP.STORY.REPLY_NAME, detail: { url, method: "POST", body: truncate(body.toString(), 1500) } });
+    await diagRecord({ kind: "http", direction: "out", label: APP.STORY.REPLY_NAME, detail: { url, method: "POST", doc_id: String(docId || APP.STORY.REPLY_DOC), body: truncate(body.toString(), 1500) } });
     const response = await fetch(url, { method: "POST", credentials: "include", headers: requestHeaders, body });
     const raw = await response.text();
     await diagRecord({ kind: "http", direction: "in", label: APP.STORY.REPLY_NAME, detail: { status: response.status, body: truncate(raw, 1500) } });
@@ -590,24 +664,101 @@
     try { payload = JSON.parse(raw); } catch (_error) { throw apiError(response.status, "story reply returned non-JSON"); }
     const result = payload?.data?.direct_story_share_reply_with_slide_message_response;
     if (result?.message_id || result?.id) {
-      return { ok: true, via: "story_reply", media_id: story.media_id, message_id: result.message_id || result.id };
+      return { ok: true, via: "story_reply", media_id: story.media_id, message_id: result.message_id || result.id, story };
     }
-    return { ok: false, reason: payload?.errors?.[0]?.message || "story_send_rejected" };
+    return { ok: false, reason: payload?.errors?.[0]?.message || "story_send_rejected", raw, story, doc_id: String(docId || APP.STORY.REPLY_DOC) };
+  }
+
+  /**
+   * URL-encoded form field reader for captured outgoing GraphQL bodies, which
+   * arrive here as the text the official client sent — `fb_api_req_friendly_name`
+   * and `doc_id` live side by side in it. Cheap and tolerant of partial bodies.
+   */
+  function parseFormField(body, name) {
+    try { return new URLSearchParams(String(body || "")).get(name); } catch (_error) { return null; }
+  }
+
+  /**
+   * Resolve the live story-reply `doc_id`, preferring evidence over a hardcoded
+   * constant: the page bundle (harvested by `findStoryReplyDocId`) and the
+   * captured outgoing GraphQL request (stored by the `INJECT_CAPTURE` handler)
+   * both beat `APP.STORY.REPLY_DOC`, which Instagram retires from time to time.
+   */
+  async function resolveStoryDocId(tokens) {
+    if (tokens?.story_reply_doc_id) return String(tokens.story_reply_doc_id);
+    const captured = await storage.getValue("story_reply_doc_id");
+    if (captured) return String(captured);
+    return APP.STORY.REPLY_DOC;
+  }
+
+  /**
+   * Instagram answers a retired `doc_id` with HTTP 200 and an error whose text
+   * names the query as unknown/unparseable. Detect that signature so the retry
+   * only runs when a fresh `doc_id` could plausibly help — not on every reject.
+   */
+  function looksLikeStaleDocId(result) {
+    const text = `${result?.reason || ""} ${JSON.stringify(result?.raw?.errors || result?.raw || {})}`.toLowerCase();
+    return /could not (parse|retrieve) query|invalid query|unknown query|document id|doc id|"code"\s*:\s*8\b/.test(text);
   }
 
   async function trySendStoryReply(user, text) {
+    let story;
     try {
       const tokens = readWebTokens();
       if (!tokens.fb_dtsg || !tokens.lsd || !tokens.av) {
         return { ok: false, reason: "web_tokens_missing" };
       }
-      const story = await findActiveStory(String(user.id));
+      story = await findActiveStory(String(user.id));
       if (!story?.media_id) return { ok: false, reason: "no_story" };
-      return await postStoryReply(user, text, story, tokens);
+      const docId = await resolveStoryDocId(tokens);
+      const first = await postStoryReply(user, text, story, tokens, docId);
+      if (first.ok) return first;
+      // Self-heal: a stale doc_id fails with a recognisable signature. Re-read
+      // the page bundle (a late SPA navigation can expose the Relay preset only
+      // after the first attempt) and the capture cache, then retry exactly once
+      // with a different doc_id. Never more than once, to avoid a retry loop.
+      if (looksLikeStaleDocId(first)) {
+        const freshTokens = readWebTokens();
+        const fresh = await resolveStoryDocId({ ...freshTokens, story_reply_doc_id: freshTokens.story_reply_doc_id || tokens.story_reply_doc_id });
+        if (fresh && fresh !== docId) {
+          await diagRecord({ kind: "note", label: "doc_id.self_heal", detail: { stale: docId, fresh } });
+          const retry = await postStoryReply(user, text, story, tokens, fresh);
+          if (retry.ok) return retry;
+          return { ...retry, story, first_reason: first.reason };
+        }
+      }
+      return { ...first, story };
     } catch (error) {
       if (error?.status === STATUS.LOGGED_OUT) throw error;
       await diagRecord({ kind: "note", label: "story.error", detail: { message: error.message, status: error.status || null } });
-      return { ok: false, reason: error.message || "story_error" };
+      return { ok: false, reason: error.message || "story_error", story };
+    }
+  }
+
+  /**
+   * MQTT `reel_share` — the GraphQL-independent story-reply transport. It opens
+   * a Direct thread (for `thread_id`) and publishes `/ig_send_message` with
+   * `item_type:"reel_share"`, carrying `reel_id` and `media_id` from the active
+   * story. Used only as the last story-reply tier, after the GraphQL mutation
+   * has failed; if it also fails, the regular Direct text path runs unchanged.
+   */
+  async function postStoryReplyMqtt(user, text, story) {
+    try {
+      const payload = await createThread(user);
+      if (!payload?.thread_id) return { ok: false, reason: "no_thread" };
+      const result = await dispatchMqtt({
+        thread_id: payload.thread_id,
+        viewer_id: payload.viewer_id,
+        user, text,
+        item_type: "reel_share",
+        reel_share: { reel_id: String(story.reel_id), media_id: String(story.media_id) }
+      });
+      if (result.ret === 1) {
+        return { ok: true, via: "story_reply_mqtt", media_id: story.media_id, thread_id: payload.thread_id };
+      }
+      return { ok: false, reason: `mqtt_${result.status_code ?? "?"}`, error_code: result.error_code || null };
+    } catch (error) {
+      return { ok: false, reason: error.message || "reel_share_error" };
     }
   }
 
@@ -618,7 +769,13 @@
     const bot = await workBot();
     if (bot?.prefer_story_reply) {
       const story = await trySendStoryReply(user, text);
-      if (story?.ok) return recordSuccess(user, text, { via: "story_reply", media_id: story.media_id, message_id: story.message_id });
+      if (story?.ok) return recordSuccess(user, text, { via: story.via || "story_reply", media_id: story.media_id, message_id: story.message_id, thread_id: story.thread_id });
+      // Tier 2: MQTT reel_share, when we still have a replyable story.
+      if (story?.story?.media_id) {
+        const mqtt = await postStoryReplyMqtt(user, text, story.story);
+        if (mqtt?.ok) return recordSuccess(user, text, { via: mqtt.via, media_id: mqtt.media_id, thread_id: mqtt.thread_id });
+        await diagRecord({ kind: "note", label: "story.fallback_reel_share_failed", detail: { username: user.username, reason: mqtt?.reason } });
+      }
       await diagRecord({ kind: "note", label: "story.fallback_direct", detail: { username: user.username, reason: story?.reason || "unknown" } });
     }
     return sendRecipient(user, listId, csvRow, goDup, text);
@@ -685,7 +842,8 @@
   }
 
   async function recordSuccess(user, text, extra = {}) {
-    const state = await storage.get(["work_bot", "dm_message_history_pool", "dm_user_history_pool", "dm_custom_queue_bot_pool"]);
+    const state = await getPools(["dm_message_history_pool", "dm_user_history_pool", "dm_custom_queue_bot_pool"]);
+    state.work_bot = await storage.getValue("work_bot");
     const record = { ...user, text, st_time: Date.now(), via: extra.via || "direct", ...extra };
     const messages = state.dm_message_history_pool || [], users = state.dm_user_history_pool || [];
     messages.push(record); users.push(record);
@@ -695,7 +853,12 @@
     if (bot.bot_type === 0 && bot.dm_num >= Number(bot.day_dm_num)) bot.is_complete = true;
     if (bot.bot_type === 1 && bot.bulk_dm_target_type !== 2 && bot.dm_num >= Number(bot.bulk_limit_max_users_count)) bot.is_complete = true;
     if (bot.bot_type === 1 && bot.bulk_dm_target_type === 2 && queue.length === 0) bot.is_complete = true;
-    await storage.set({ work_bot: bot, dm_message_history_pool: messages, dm_user_history_pool: users, dm_custom_queue_bot_pool: queue });
+    await storage.set({ work_bot: bot });
+    await setPools([
+      ["dm_message_history_pool", messages],
+      ["dm_user_history_pool", users],
+      ["dm_custom_queue_bot_pool", queue]
+    ]);
     await notify();
     if (!bot.is_complete) scheduleNextDm();
   }
@@ -723,9 +886,9 @@
    * unrelated CSV row whenever a Monitor recipient turned out to be 404.
    */
   async function unavailable(username) {
-    const missing = await storage.getValue("dm_404_custom_dup_users_history_bot", []);
+    const missing = await getPool("dm_404_custom_dup_users_history_bot", []);
     if (!missing.some((item) => item.username === username)) missing.push({ username, st_time: Date.now() });
-    await storage.set({ dm_404_custom_dup_users_history_bot: missing });
+    await setPools([["dm_404_custom_dup_users_history_bot", missing]]);
     return fastNext();
   }
 
@@ -745,8 +908,14 @@
       return;
     }
     const status = Number(error.status || 0);
-    // A rejected session must not be reused by the next run.
-    if ([401, 403, STATUS.LOGGED_OUT].includes(status)) dropSession();
+    // A rejected session must not be reused by the next run. An account switch
+    // mid-campaign is the same class of failure: the cached ds_user_id is no
+    // longer the live one, so the next cycle must re-read both cookies.
+    if ([401, 403, STATUS.LOGGED_OUT, STATUS.ACCOUNT_CHANGED].includes(status)) dropSession();
+    if (status === STATUS.ACCOUNT_CHANGED) {
+      await updateBot({ status_code: STATUS.ACCOUNT_CHANGED, status_data_msg: DMHCore.STATUS_MESSAGE[STATUS.ACCOUNT_CHANGED], is_working: false });
+      return;
+    }
     const key = String(status);
     const defaults = DMHCore.ERROR_DEFAULTS[key];
     if (defaults && error.lookup) {
@@ -764,6 +933,10 @@
     sendRecipient,
     sendRecipientMaybeStory,
     trySendStoryReply,
+    postStoryReplyMqtt,
+    resolveStoryDocId,
+    looksLikeStaleDocId,
+    parseFormField,
     findActiveStory,
     collectPageContext,
     dumpPageContext,
@@ -778,6 +951,7 @@
     sendBulk,
     sendCustom,
     assertDmListsReady,
+    assertSameAccount,
     isDuplicateRecipient,
     unavailable,
     scheduleNextDm,

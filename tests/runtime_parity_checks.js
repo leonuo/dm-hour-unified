@@ -231,7 +231,7 @@ async function testContentApiFlows() {
   assert.equal(calls[0].options.credentials, "include");
   assert.equal(calls[0].options.headers["X-CSRFToken"], "csrf-token");
   assert.equal(calls[0].options.headers["X-IG-App-ID"], "936619743392459");
-  assert.deepEqual(store.state.monitor_inbox_pool.map((entry) => [entry.id, entry.type]), [["10", 0], ["11", 1]]);
+  assert.deepEqual(store.state["viewer-cookie:monitor_inbox_pool"].map((entry) => [entry.id, entry.type]), [["10", 0], ["11", 1]]);
   assert.equal(portMessages.at(-1).type, "checkMonitorAlarmOrSendDM");
 
   responseKind = "followers";
@@ -266,11 +266,11 @@ async function testContentApiFlows() {
   assert.equal(dispatch.thread_id, "thread-1");
   assert.equal(dispatch.viewer_id, "viewer-1");
   assert.equal(dispatch.text, "Hi creator from Kyiv");
-  assert.equal(store.state.dm_message_history_pool.length, 1);
-  assert.equal(store.state.dm_user_history_pool.length, 1);
+  assert.equal(store.state["viewer-cookie:dm_message_history_pool"].length, 1);
+  assert.equal(store.state["viewer-cookie:dm_user_history_pool"].length, 1);
   assert.equal(store.state.work_bot.dm_num, 1);
   assert.equal(store.state.work_bot.is_complete, true);
-  assert.equal(store.state.dm_custom_queue_bot_pool.length, 0);
+  assert.equal(store.state["viewer-cookie:dm_custom_queue_bot_pool"].length, 0);
   assert.ok(runtimeMessages.some((message) => message.type === "RELOAD_WORK_BOT_HOME_MSG"));
 }
 
@@ -684,6 +684,85 @@ function coreHarness(initialState = {}) {
 }
 
 /**
+ * Account-scoped pools and the mid-run account-switch guard. Two Instagram
+ * accounts in one Chrome profile must keep separate history and limits, and a
+ * campaign started under one account must stop rather than send from another.
+ */
+async function testAccountScopingAndSwitch() {
+  // A bot bound to the live session runs without complaint.
+  {
+    const { api } = contentHarness({});
+    api.setSession({ ds_user_id: "viewer-cookie", csrftoken: "csrf-token" });
+    await api.assertSameAccount({ account_id: "viewer-cookie" });
+  }
+  // A bot bound to a different account stops with ACCOUNT_CHANGED.
+  {
+    const { api } = contentHarness({});
+    api.setSession({ ds_user_id: "viewer-cookie", csrftoken: "csrf-token" });
+    const error = await rejection(api.assertSameAccount({ account_id: "other-account" }));
+    assert.equal(error.status, 10005);
+    assert.match(error.message, /account changed mid-run/i);
+  }
+  // Pools are namespaced by ds_user_id; two accounts never mix.
+  {
+    const { api, store } = contentHarness({});
+    api.setSession({ ds_user_id: "aaa", csrftoken: "x" });
+    await api.unavailable("user_a");
+    api.setSession({ ds_user_id: "bbb", csrftoken: "x" });
+    await api.unavailable("user_b");
+    assert.deepEqual(store.state["aaa:dm_404_custom_dup_users_history_bot"].map((r) => r.username), ["user_a"]);
+    assert.deepEqual(store.state["bbb:dm_404_custom_dup_users_history_bot"].map((r) => r.username), ["user_b"]);
+    assert.equal(store.state.dm_404_custom_dup_users_history_bot, undefined, "no unscoped pool leaks");
+  }
+}
+
+/**
+ * Self-healing for the story-reply GraphQL doc_id. Instagram retires doc_ids;
+ * the bundle and the captured outgoing request both carry the live value, and a
+ * stale signature triggers exactly one retry with a fresh doc_id.
+ */
+async function testStoryDocIdSelfHeal() {
+  const { api } = contentHarness({ story_reply_doc_id: "99999" });
+  api.setSession({ ds_user_id: "v", csrftoken: "c" });
+  // Captured doc_id beats the hardcoded constant.
+  assert.equal(await api.resolveStoryDocId({ story_reply_doc_id: null }), "99999");
+  // A live doc_id harvested from the page bundle beats the captured one.
+  assert.equal(await api.resolveStoryDocId({ story_reply_doc_id: "88888" }), "88888");
+  // Stale-signature detection gates the retry.
+  assert.equal(api.looksLikeStaleDocId({ reason: "Could not parse query" }), true);
+  assert.equal(api.looksLikeStaleDocId({ reason: "Invalid query id" }), true);
+  assert.equal(api.looksLikeStaleDocId({ reason: "story_send_rejected" }), false);
+  // The URL-encoded outgoing GraphQL body is parsed for the friendly-name/doc_id pair.
+  const body = "fb_api_req_friendly_name=IGDirectStoryShareReplyMutation&doc_id=55555&variables=%7B%7D";
+  assert.equal(api.parseFormField(body, "doc_id"), "55555");
+  assert.equal(api.parseFormField(body, "fb_api_req_friendly_name"), "IGDirectStoryShareReplyMutation");
+}
+
+/**
+ * XLSX history round trip: the dependency-free port of `backend/dmhour/xlsx.py`
+ * writes a workbook the same module can read back, so DM History and DM Box
+ * can be exported and re-imported as `.xlsx` (the last unimplemented rubric row).
+ */
+async function testXlsxRoundtrip() {
+  const context = baseContext({
+    Blob, DataView, Uint8Array, ArrayBuffer, TextEncoder, TextDecoder, JSON, Math
+  });
+  load(context, "xlsx.js");
+  const Xlsx = context.DMHXlsx;
+  const records = [{ Username: "alice", City: "Kyiv" }, { Username: "bob", City: "Lviv" }];
+  const rows = Xlsx.recordsToRows(records);
+  assert.equal(JSON.stringify(rows[0]), JSON.stringify(["Username", "City"]));
+  assert.equal(JSON.stringify(rows[1]), JSON.stringify(["alice", "Kyiv"]));
+  const blob = await Xlsx.writeXlsxBlob(rows);
+  const back = await Xlsx.readXlsxDicts(await blob.arrayBuffer());
+  assert.equal(back.length, 2);
+  assert.equal(back[0].Username, "alice");
+  assert.equal(back[0].City, "Kyiv");
+  assert.equal(back[1].Username, "bob");
+  assert.equal(back[1].City, "Lviv");
+}
+
+/**
  * Stage 1 safety net: the schema stamp that lets future format changes migrate
  * instead of silently misreading existing pools, and a full-store backup that
  * survives a round trip.
@@ -695,16 +774,17 @@ async function testStorageSafety() {
     // Objects come from the sandbox realm, so compare fields, not prototypes.
     const result = await core.migrateStorage();
     assert.equal(result.from, 0);
-    assert.equal(result.to, 2);
-    assert.equal(JSON.stringify(result.applied), "[2]");
-    assert.equal(store.state.schema_version, 2);
+    assert.equal(result.to, 3);
+    assert.equal(JSON.stringify(result.applied), "[2,3]");
+    assert.equal(store.state.schema_version, 3);
     assert.equal(store.state.bot_list.length, 1);
     assert.equal(store.state.bot_list[0].prefer_story_reply, false);
+    assert.equal(store.state.bot_list[0].account_id, null);
     assert.equal(store.state.dm_user_history_pool.length, 1);
     // Running it again is a no-op.
     const again = await core.migrateStorage();
-    assert.equal(again.from, 2);
-    assert.equal(again.to, 2);
+    assert.equal(again.from, 3);
+    assert.equal(again.to, 3);
   }
 
   // A store written by a newer build is refused rather than misread.
@@ -737,7 +817,7 @@ async function testStorageSafety() {
     assert.equal(store.state.bot_list[0].bot_name, "Monitor");
     assert.equal(store.state.comments[0].content, "hi");
     assert.equal(store.state.dm_user_history_pool[0].username, "someone");
-    assert.equal(store.state.schema_version, 2);
+    assert.equal(store.state.schema_version, 3);
   }
 
   // Junk and future backups are rejected before the store is touched.
@@ -842,6 +922,26 @@ async function testMqttBridge() {
   assert.equal(payload.thread_id, "thread-7");
   assert.match(payload.device_id, /^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/);
   assert.equal(payload.mutation_token, payload.client_context - 100000);
+
+  // reel_share item: the same /ig_send_message publish, with item_type
+  // overridden to "reel_share" and the reel_share object attached. This is the
+  // story-reply fallback tier that runs when the GraphQL mutation has failed.
+  sentPackets.length = 0;
+  const reelRequest = {
+    type: "INJECT_DISPATCH_DM_REQUEST", request_id: "request-2",
+    thread_id: "thread-7", viewer_id: "viewer-7", text: "nice story",
+    item_type: "reel_share", reel_share: { reel_id: "user-99", media_id: "media-1" }
+  };
+  await listeners[0]({ source: windowObject, data: reelRequest });
+  const reelPublish = mqtt.decodePackets(sentPackets.find((packet) => packet[0] >> 4 === 3))[0];
+  const reelParsed = mqtt.parsePublish(reelPublish.header, reelPublish.body);
+  const reelPayload = JSON.parse(reelParsed.payload);
+  assert.equal(reelPayload.action, "send_item");
+  assert.equal(reelPayload.item_type, "reel_share");
+  assert.equal(reelPayload.text, "nice story");
+  assert.equal(reelPayload.thread_id, "thread-7");
+  assert.equal(reelPayload.reel_share.reel_id, "user-99");
+  assert.equal(reelPayload.reel_share.media_id, "media-1");
 }
 
 (async () => {
@@ -856,6 +956,9 @@ async function testMqttBridge() {
   await testUsernameNormalisation();
   await testDiagnosticsAndTestSend();
   await testPageContextParser();
+  await testAccountScopingAndSwitch();
+  await testStoryDocIdSelfHeal();
+  await testXlsxRoundtrip();
   process.stdout.write("runtime parity checks: ok\n");
 })().catch((error) => {
   console.error(error);

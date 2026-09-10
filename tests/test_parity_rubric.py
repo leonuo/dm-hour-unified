@@ -12,12 +12,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class ParityRubricTests(unittest.TestCase):
     def test_all_implemented_contract_rows_pass(self):
-        failed = [row["id"] for row in evaluate(ROOT) if row["id"] != "UI-05" and row["score"] != 1]
+        failed = [row["id"] for row in evaluate(ROOT) if row["score"] != 1]
         self.assertEqual(failed, [])
 
-    def test_xlsx_history_is_honestly_unimplemented(self):
+    def test_xlsx_history_is_implemented(self):
         row = next(row for row in evaluate(ROOT) if row["id"] == "UI-05")
-        self.assertEqual(row["score"], 0)
+        self.assertEqual(row["score"], 1)
 
     def test_message_renderer_executes_nested_spintax_and_placeholders(self):
         script = r'''

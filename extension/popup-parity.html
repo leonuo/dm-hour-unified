@@ -49,8 +49,8 @@
       <h2>DM Lists</h2><form id="list-form" class="card"><label>Назва<input id="list-name" required></label><label>Повідомлення<textarea id="list-message" rows="4" required></textarea></label><button>Додати список</button></form><div id="dm-lists"></div>
     </section>
     <section id="view-history" class="view hidden">
-      <h2>DM History</h2><div class="row"><button data-export="dm_message_history_pool">CSV export</button><button data-clear="dm_message_history_pool">Очистити</button><label class="file">CSV replace<input data-import="dm_message_history_pool" type="file" accept=".csv"></label></div><div id="message-history"></div>
-      <h2>DM Box</h2><div class="row"><button data-export="dm_user_history_pool">CSV export</button><button data-clear="dm_user_history_pool">Очистити</button><label class="file">CSV merge<input data-import="dm_user_history_pool" type="file" accept=".csv"></label></div><div id="user-history"></div>
+      <h2>DM History</h2><div class="row"><button data-export="dm_message_history_pool">CSV export</button><button data-export-xlsx="dm_message_history_pool">XLSX export</button><button data-clear="dm_message_history_pool">Очистити</button><label class="file">CSV/XLSX replace<input data-import="dm_message_history_pool" type="file" accept=".csv,.xlsx,.xls"></label></div><div id="message-history"></div>
+      <h2>DM Box</h2><div class="row"><button data-export="dm_user_history_pool">CSV export</button><button data-export-xlsx="dm_user_history_pool">XLSX export</button><button data-clear="dm_user_history_pool">Очистити</button><label class="file">CSV/XLSX merge<input data-import="dm_user_history_pool" type="file" accept=".csv,.xlsx,.xls"></label></div><div id="user-history"></div>
     </section>
     <section id="view-errors" class="view hidden"><h2>IG Error Code Handler</h2><div id="error-settings"></div></section>
     <section id="view-diag" class="view hidden">
@@ -84,6 +84,6 @@
     </section>
   </main>
   <div id="toast"></div>
-  <script src="common.js"></script><script src="popup-parity.js"></script>
+  <script src="common.js"></script><script src="xlsx.js"></script><script src="popup-parity.js"></script>
 </body>
 </html>

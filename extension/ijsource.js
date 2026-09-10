@@ -54,7 +54,7 @@
     }
   });
 
-  async function sendDirectText({ thread_id, viewer_id, text }) {
+  async function sendDirectText({ thread_id, viewer_id, text, item_type = "text", reel_share = null }) {
     if (!thread_id || !viewer_id || typeof text !== "string") {
       throw new Error("MQTT request is missing thread_id, viewer_id or text");
     }
@@ -77,6 +77,11 @@
       asi: { "Accept-Language": "en" },
       a: navigator.userAgent
     });
+    // `item_type` selects the Direct item. `text` is the default; `reel_share`
+    // is the story-reply item, carrying the target reel/media ids so the
+    // message attaches to the story rather than opening a plain thread. The
+    // default literal stays `"text"` so the verified contract is unchanged; a
+    // reel_share request overrides it after the object is built.
     const payload = {
       client_context: clientContext,
       device_id: payloadDeviceId,
@@ -86,6 +91,10 @@
       text,
       thread_id: String(thread_id)
     };
+    if (item_type === "reel_share" && reel_share) {
+      payload.item_type = "reel_share";
+      payload.reel_share = reel_share;
+    }
     const client = new MinimalMqttClient(
       "wss://edge-chat.instagram.com:443/chat",
       "mqttwsclient"
